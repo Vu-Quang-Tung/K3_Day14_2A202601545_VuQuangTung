@@ -13,6 +13,8 @@ import math
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -266,6 +268,53 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("GEMINI_MODEL is missing from .env")
+        self.api_key = api_key
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.model}:generateContent?key={self.api_key}"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": self.max_output_tokens,
+            },
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"Gemini API error: {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Gemini connection error: {exc.reason}") from exc
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("Gemini returned no candidates")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        answer = "".join(part.get("text", "") for part in parts).strip()
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -380,6 +429,7 @@ def generate_actual_answers(
     generator: TextGenerator | None = None,
     top_k: int = 5,
     progress: ProgressCallback | None = None,
+    output_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Generate the auditable actual-answer artifact for all dataset questions."""
 
@@ -406,7 +456,21 @@ def generate_actual_answers(
     )
 
     answers: list[dict[str, Any]] = []
+    existing_by_id: dict[str, dict[str, Any]] = {}
+    output_file = Path(output_path).expanduser().resolve() if output_path is not None else None
+    if output_file is not None and output_file.is_file():
+        try:
+            existing_artifact = json.loads(output_file.read_text(encoding="utf-8"))
+            for record in existing_artifact.get("answers", []):
+                if isinstance(record, dict) and "id" in record:
+                    existing_by_id[str(record["id"])] = record
+        except Exception:
+            existing_by_id = {}
+
     for index, item in enumerate(questions, start=1):
+        if item["id"] in existing_by_id and existing_by_id[item["id"]].get("error") is None:
+            answers.append(existing_by_id[item["id"]])
+            continue
         percentage = index / total
         completed_before = index - 1
         filled_before = round(20 * completed_before / total)
@@ -422,12 +486,7 @@ def generate_actual_answers(
         started_at = time.perf_counter()
         try:
             response = assistant.answer_with_trace(item["question"])
-        except Exception:
-            notify(f"FAILED at {item['id']}; stopping the run.")
-            raise
-
-        answers.append(
-            {
+            record = {
                 "id": item["id"],
                 "question": item["question"],
                 "actual_answer": response.actual_answer,
@@ -442,7 +501,35 @@ def generate_actual_answers(
                 ],
                 "error": None,
             }
-        )
+        except Exception as exc:
+            notify(f"FAILED at {item['id']}; continuing to next question.")
+            record = {
+                "id": item["id"],
+                "question": item["question"],
+                "actual_answer": "",
+                "retrieved_contexts": [],
+                "error": str(exc),
+            }
+
+        answers.append(record)
+        if output_file is not None:
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            partial_artifact = {
+                "schema_version": "1.0",
+                "corpus_id": assistant.corpus_id,
+                "generated_at": datetime.now(UTC).isoformat(),
+                "agent": {
+                    "name": "domain-assistant",
+                    "model": model,
+                    "top_k": top_k,
+                    "prompt_version": "1.0",
+                },
+                "answers": answers,
+            }
+            output_file.write_text(
+                json.dumps(partial_artifact, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
         filled_after = round(20 * percentage)
         bar_after = "#" * filled_after + "-" * (20 - filled_after)
@@ -489,17 +576,32 @@ def parse_args() -> argparse.Namespace:
         help="Output artifact (default: artifacts/actual_answers.json)",
     )
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--provider",
+        type=str,
+        default=None,
+        choices=["openai", "gemini"],
+        help="Text generation provider override",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
+        provider = (args.provider or os.getenv("GENERATOR_PROVIDER", "openai")).strip().lower()
+        generator: TextGenerator
+        if provider == "gemini":
+            generator = GeminiGenerator()
+        else:
+            generator = OpenAIGenerator()
         artifact = generate_actual_answers(
             args.dataset,
             args.corpus_dir,
+            generator=generator,
             top_k=args.top_k,
             progress=lambda message: print(message, flush=True),
+            output_path=args.output,
         )
         output = args.output.expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)

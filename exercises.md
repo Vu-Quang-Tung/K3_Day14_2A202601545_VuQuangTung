@@ -30,11 +30,11 @@ critical.
 
 | Metric | Acceptable Low Score Scenario | Critical Low Score Scenario | Action Required |
 |---|---|---|---|
-| Faithfulness | | | |
-| Answer Relevance | | | |
-| Context Recall | | | |
-| Context Precision | | | |
-| Completeness | | | |
+| Faithfulness | Hơi dưới mục tiêu khi câu trả lời vẫn bám theo ngữ cảnh nhưng có một cụm nhỏ chưa được hỗ trợ, và cụm đó không làm đổi khuyến nghị chính. | Dưới 0.6 khi câu trả lời bịa ra chính sách, ngày tháng, số tiền hoặc ngoại lệ không có trong nguồn. | Siết chặt grounding, kiểm tra prompt/ngữ cảnh, và chặn deploy nếu có claim không được hỗ trợ. |
+| Answer Relevance | Điểm thấp nhưng vẫn chấp nhận được trong các câu hỏi thăm dò hoặc trả lời chưa trọn vẹn, miễn là câu trả lời vẫn đúng chủ đề chính. | Dưới 0.6 khi câu trả lời bỏ qua ý định người dùng hoặc trả lời sang một chủ đề student-services khác. | Sửa routing/prompt và kiểm tra model có trả lời trực tiếp đúng câu hỏi hay không. |
+| Context Recall | Hơi thấp nhưng vẫn chấp nhận được khi tập retrieved vẫn có evidence chính, chỉ thiếu một vài chi tiết phụ. | Dưới 0.6 khi retriever bỏ sót hoàn toàn evidence chính hoặc chỉ trả về các chunk nhiễu. | Cải thiện retrieval, chunking hoặc cách viết query trước khi chỉnh generation. |
+| Context Precision | Điểm trung bình-thấp có thể tạm chấp nhận với câu hỏi multi-hop rộng nếu chunk liên quan vẫn có mặt và nhiễu không quá nhiều. | Dưới 0.6 khi phần lớn chunk truy xuất là không liên quan và evidence hữu ích bị chôn xuống dưới. | Re-rank, giảm nhiễu, hoặc tinh chỉnh retrieval để đưa evidence đúng lên sớm hơn. |
+| Completeness | Hơi thấp nhưng vẫn chấp nhận được khi câu trả lời nêu đúng quy tắc chính nhưng thiếu một điều kiện phụ không làm đổi kết luận cốt lõi. | Dưới 0.6 khi thiếu ngày tháng, số tiền, ngoại lệ hoặc các bước tiếp theo quan trọng. | Mở rộng độ bao phủ câu trả lời và đối chiếu lại expected-answer với corpus. |
 
 ### Exercise 1.2 — Bias trong LLM-as-a-Judge
 
@@ -48,13 +48,19 @@ Ba bias thường gặp:
 
 > *Câu trả lời:*
 
+Chạy cùng một câu hỏi với hai thứ tự hiển thị khác nhau: một lần cho response A đứng trước, một lần cho response B đứng trước, trong khi nội dung hai câu trả lời tương đương. Nếu điểm số thường xuyên ưu tiên câu trả lời ở vị trí đầu tiên qua nhiều lần thử, đó là dấu hiệu của position bias. Có thể làm phiên bản mạnh hơn bằng cách random thứ tự trên nhiều cặp so sánh rồi kiểm tra xem lựa chọn được hiển thị trước có thắng nhiều hơn ngẫu nhiên hay không.
+
 **Câu 2: Làm thế nào giảm verbosity bias bằng rubric design?**
 
 > *Câu trả lời:*
 
+Dùng rubric nhấn mạnh chất lượng nội dung thay vì độ dài: quy định rõ rằng câu dài hơn không tự động được điểm cao hơn nếu không thêm evidence đúng, điều kiện bắt buộc hoặc thông tin giúp câu trả lời đầy đủ hơn. Có thể phạt phần lặp lại, lan man, hoặc mở rộng không có căn cứ, và giới hạn điểm với câu trả lời dài nhưng vẫn thiếu ý. Câu ngắn gọn nhưng đủ thông tin quan trọng nên được chấm cao hơn câu dài có cùng nội dung.
+
 **Câu 3: Tại sao cần calibrate LLM judge với human labels?**
 
 > *Câu trả lời:*
+
+Nhãn do con người gán giúp phát hiện lỗi trong rubric và các edge case đặc thù của domain mà LLM judge có thể bỏ sót hoặc đánh giá quá cao. Việc calibration giúp judge bám sát chất lượng mục tiêu thực tế, đo được bias hệ thống và đặt threshold có cơ sở khi dùng trong CI/CD. Nó cũng giúp tránh tin vào một judge lúc thì quá dễ dãi, lúc thì quá khắt khe, hoặc bị ảnh hưởng bởi cách diễn đạt thay vì tính đúng đắn.
 
 ### Exercise 1.3 — Evaluation trong CI/CD
 
@@ -62,13 +68,15 @@ Ba bias thường gặp:
 
 | Metric | Threshold | Lý do |
 |---|---:|---|
-| Faithfulness | | |
-| Answer Relevance | | |
-| Completeness | | |
+| Faithfulness | 0.80 | Các claim không được hỗ trợ rất rủi ro trong câu trả lời policy, nên điểm thấp hơn mức này thường báo hiệu hallucination cần chặn release. |
+| Answer Relevance | 0.75 | Assistant phải trả lời đúng câu hỏi thực sự của sinh viên; điểm thấp thường cho thấy lỗi routing hoặc prompt. |
+| Completeness | 0.75 | Thiếu ngày tháng, mức phí hoặc ngoại lệ có thể làm câu trả lời dù đúng vẫn không an toàn hoặc không dùng được. |
 
 **Câu 2: Khi nào dùng offline evaluation, online evaluation và human review?**
 
 > *Câu trả lời:*
+
+Dùng offline evaluation cho mọi thay đổi về prompt, retriever hoặc model trước khi merge vì nó lặp lại được, rẻ và tốt cho việc phát hiện regression. Dùng online evaluation sau khi deploy để theo dõi traffic thật, drift và các lỗi bất ngờ. Dùng human review cho các quyết định rủi ro cao, các case mơ hồ hoặc để calibration chất lượng judge/rubric.
 
 ---
 
